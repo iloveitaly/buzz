@@ -17,6 +17,7 @@ import '../../shared/theme/theme.dart';
 import '../../shared/widgets/avatar_image.dart';
 import '../profile/user_cache_provider.dart';
 import '../profile/user_profile.dart';
+import '../activity/compose_drafts_provider.dart';
 import '../custom_emoji/custom_emoji.dart';
 import '../custom_emoji/custom_emoji_provider.dart';
 import 'camera_capture_cleanup.dart';
@@ -77,6 +78,29 @@ class ComposeBar extends HookConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final controller = useMemoized(_MarkdownEditingController.new);
     useEffect(() => controller.dispose, [controller]);
+
+    // Restore and persist unsent text as a local draft so the Activity
+    // inbox Drafts filter reflects real composer state.
+    final draftKey = composeDraftKey(channelId, threadHeadId: threadHeadId);
+    useEffect(() {
+      final saved = ref.read(composeDraftsProvider.notifier).textFor(draftKey);
+      if (saved != null && controller.text.isEmpty) {
+        controller.text = saved;
+      }
+      void persistDraft() {
+        ref
+            .read(composeDraftsProvider.notifier)
+            .save(
+              key: draftKey,
+              channelId: channelId,
+              threadHeadId: threadHeadId,
+              text: controller.text,
+            );
+      }
+
+      controller.addListener(persistDraft);
+      return () => controller.removeListener(persistDraft);
+    }, [controller, draftKey]);
     final focusNode = useFocusNode();
     final isComposerExpanded = useState(false);
     final showAttachments = useState(false);
