@@ -24,7 +24,7 @@ This NIP defines a minimal, privacy-preserving protocol for propagating read sta
 
 ## Non-Goals
 
-This NIP does not define a durable log of all read messages — blobs are best-effort recent activity hints bounded by a time horizon. Exception: `ov_*` override entries, including tombstone floors, are durable as long as stale override components may be accepted (see Manual-Unread Override Layer — Override State Durability).
+This NIP does not define a durable log of all read messages — frontier blobs are best-effort recent activity hints bounded by a time horizon. Exception: `ov_*` override entries, including tombstone floors, are durable state — they are exempt from age pruning, budget eviction, and horizon-bounded fetching, and MUST be carried forward before any coordinate holding them is retired (see Manual-Unread Override Layer — Override State Durability).
 This NIP does not define cross-client interoperability on context ID format — context identifiers are opaque by default and meaningful only within a single client family, except for OPTIONAL well-known schemes defined in this NIP (`thread:<root-event-id>` and `msg:<event-id>`, defined under Read Context Schemes), which are provided for cross-client thread/message-read interoperability.
 This NIP does not guarantee ordering of read events across devices.
 This NIP does not require relay-side logic.
@@ -294,13 +294,15 @@ Because context timestamps are derived from message `created_at` values — whic
 
 ### Fetching
 
-To load read state, a client MUST fetch all `kind:30078` events for the user within the time horizon using the `#t` filter:
+To load read state, a client MUST fetch all `kind:30078` events for the user using the `#t` filter:
 
 ```json
-{"kinds": [30078], "authors": ["<user-pubkey>"], "#t": ["read-state"], "since": <now - horizon>}
+{"kinds": [30078], "authors": ["<user-pubkey>"], "#t": ["read-state"]}
 ```
 
-Clients SHOULD limit the fetch to events with `created_at` within a configurable time horizon (default: 7 days). Note: the time horizon applies to frontier context entries only. `ov_*` override entries (including tombstone floors) MUST NOT be omitted from blobs solely because of age; see Override State Durability in the Manual-Unread Override Layer section.
+Clients that neither read nor write `ov_*` override state SHOULD limit the fetch to events with `created_at` within a configurable time horizon (default: 7 days) by adding `"since": <now - horizon>`, accepting that frontiers older than the horizon become unknown.
+
+Clients that implement the manual-unread override layer MUST NOT apply a finite `since` filter to a full-state load; they MUST fetch all of the user's `read-state` coordinates. Because the payload is encrypted, a relay filter cannot select for override-bearing events: any event-level window can exclude the only coordinate carrying a tombstone floor, which reopens the resurrection witness in Override State Durability regardless of any per-entry exemption. This is cheap: `kind:30078` is addressable/replaceable, so the number of events returned is bounded by (client instances x active slots per instance), not by elapsed time. For these clients the time horizon is a *write-time* frontier pruning policy only (see Debounce and Pruning), never a fetch filter.
 
 After fetching, clients MUST:
 
@@ -308,11 +310,11 @@ After fetching, clients MUST:
 2. Discard blobs that fail validation (see Content Validation).
 3. Identify the blob whose decrypted `client_id` matches the client's own `client_id` — this is the client's own blob.
 
-If multiple blobs decrypt to the same `client_id` (e.g., due to a prior rotation that left an orphaned blob, or a backup/restore that duplicated identifiers), the client MUST treat the blob with the highest `created_at` as its own for single-slot clients and merge all others into the read state as if they were from other instances. The client SHOULD delete the stale duplicate(s) via NIP-09 deletion. For multi-slot clients, same-`client_id` blobs at coordinates within the client's active slot set are active split slots and MUST be unioned together, not treated as duplicates (see `d` Tag — Multi-slot clients).
+If multiple blobs decrypt to the same `client_id` (e.g., due to a prior rotation that left an orphaned blob, or a backup/restore that duplicated identifiers), the client MUST treat the blob with the highest `created_at` as its own for single-slot clients and merge all others into the read state as if they were from other instances. Deletion of such a stale duplicate is governed by Orphaned Blob Deletion — a duplicate carrying `ov_*` entries MUST NOT be deleted until its override state has been carried forward. For multi-slot clients, same-`client_id` blobs at coordinates within the client's active slot set are active split slots and MUST be unioned together, not treated as duplicates (see `d` Tag — Multi-slot clients).
 
 4. Merge all valid blobs (including the client's own) using the merge rule.
 
-Absence of a context in all fetched blobs means the read state for that context is **unknown** — clients SHOULD treat unknown contexts as unread (conservative default). The horizon is a storage and fetch optimization, not a semantic claim about read status. Contexts that were read but have aged out of the time horizon are indistinguishable from never-read contexts. Clients MAY extend the horizon or maintain a local cache to mitigate this.
+Absence of a context in all fetched blobs means the read state for that context is **unknown** — clients SHOULD treat unknown contexts as unread (conservative default). For clients using a finite horizon, the horizon is a storage and fetch optimization, not a semantic claim about read status: contexts that were read but have aged out of the time horizon are indistinguishable from never-read contexts. Clients MAY extend the horizon or maintain a local cache to mitigate this. Clients implementing the override layer do not filter the fetch by age at all (see above), so for them this ambiguity arises only from write-time frontier pruning.
 
 ### Merge Rule
 
@@ -339,7 +341,7 @@ Each client instance maintains its own blob (one `kind:30078` event per active `
 
 Clients MUST only update blobs whose decrypted `client_id` matches their own `client_id`. Clients MUST NOT overwrite another instance's blob.
 
-If the client discovers same-`client_id` blobs at coordinates **not** in its own persisted active slot set (e.g., rotation orphans or backup/restore duplicates), it MUST treat the blob with the highest `created_at` as the reference for merging and SHOULD delete the orphaned coordinate(s) via NIP-09. Multiple same-`client_id` blobs at coordinates that **are** in its own active slot set are active split slots and MUST NOT be deleted as duplicates.
+If the client discovers same-`client_id` blobs at coordinates **not** in its own persisted active slot set (e.g., rotation orphans or backup/restore duplicates), it MUST merge them into its own state and MUST NOT delete them until their override state has been carried forward (see Orphaned Blob Deletion). For the purpose of choosing which blob's non-override metadata to treat as its own current reference, the highest `created_at` wins. Multiple same-`client_id` blobs at coordinates that **are** in its own active slot set are active split slots and MUST NOT be deleted as duplicates.
 
 #### Read-Before-Write
 
@@ -364,7 +366,9 @@ Alternatively, multi-slot clients MAY fetch by `#t` and filter to own `client_id
 2. Decrypt and merge the fetched blob(s) with local state using `max()` per context.
 3. Publish the merged result.
 
-If a relay is unreachable during the fetch step, the client SHOULD proceed with the data available from reachable relays. The merge rule ensures that data from the unreachable relay will be incorporated on the next successful fetch, provided the relay retains the event. Permanent relay loss or event expiry may result in state loss — this is an accepted property of the best-effort model (see Non-Goals).
+If a relay is unreachable during the fetch step, the client SHOULD proceed with the data available from reachable relays. The merge rule ensures that data from the unreachable relay will be incorporated on the next successful fetch, provided the relay retains the event. Permanent relay loss or event expiry may result in loss of frontier state — this is an accepted property of the best-effort model (see Non-Goals).
+
+That accepted loss does not extend to override state. A client MUST NOT treat a fetch that failed on any relay it publishes to as a complete view of its own override state, and MUST NOT retire, rebalance, or delete any of its own coordinates on the basis of such a partial fetch (see Slot Rebalancing and Retirement). Clients implementing the override layer SHOULD publish override state to more than one relay so that the loss of a single relay does not erase a tombstone floor.
 
 This read-before-write requirement also applies to re-publishes triggered by incoming blobs from other instances (see Live Subscription and Convergence).
 
@@ -399,15 +403,31 @@ The blob SHOULD contain only contexts the client has explicitly interacted with.
 
 #### Client-ID Rotation
 
-Clients MAY rotate their `client_id` by generating a new one, generating a new random `<slot-id>` (or a new set of slot IDs for multi-slot clients), and publishing a new blob. The old blob(s) become orphaned and age out of the time horizon naturally. Rotation adds one extra blob (or set of blobs) temporarily. Clients SHOULD keep their `client_id` stable for as long as possible to minimize blob proliferation.
+Clients MAY rotate their `client_id` by generating a new one, generating a new random `<slot-id>` (or a new set of slot IDs for multi-slot clients), and publishing a new blob. Rotation adds one extra blob (or set of blobs) temporarily. Clients SHOULD keep their `client_id` stable for as long as possible to minimize blob proliferation.
 
-If a device backup or clone results in two installations sharing the same `client_id` and slot-id set, both will write to the same coordinates. This is operationally equivalent to a single client and does not corrupt state, but the two installations will overwrite each other's context entries. Clients that detect this condition (e.g., by observing unexpected context changes in their own blob) SHOULD generate a new `client_id` and fresh slot IDs.
+A client that carries `ov_*` override state MUST complete the transition in Slot Rebalancing and Retirement before abandoning its old coordinates: the componentwise-max of every override register, including all tombstone floors, MUST be published under the new coordinates and accepted by the relay first. Old coordinates MUST NOT be left to age out while they are the only carrier of an override floor.
+
+If a device backup or clone results in two installations sharing the same `client_id` and slot-id set, both will write to the same coordinates. This is operationally equivalent to a single client and does not corrupt state, but the two installations will overwrite each other's context entries. Clients that detect this condition (e.g., by observing unexpected context changes in their own blob) SHOULD generate a new `client_id` and fresh slot IDs, again carrying override state forward per Slot Rebalancing and Retirement.
+
+#### Slot Rebalancing and Retirement
+
+A multi-slot client changes its set of active coordinates when it splits, merges, or rebalances slots (e.g., because a blob outgrew the size budget). Because a coordinate is a replaceable event, overwriting one in place destroys the groups it previously held. A client MUST therefore perform the transition in this order, and MUST NOT reorder or partially apply it:
+
+1. Fetch ALL coordinates in the current active slot set (see Read-Before-Write), merge them componentwise, and canonicalize the merged override state (see Mandatory Canonical Publication). If the fetch failed on any relay the client publishes to, abort the transition — the client MUST NOT proceed on a partial view.
+2. Allocate **fresh** `<slot-id>` values for the replacement slots. Destructive in-place reuse of an existing active coordinate during a rebalance is prohibited: overwriting a coordinate removes the groups it held before their replacement exists, and a crash before the remaining publishes makes that gap durable. (Rebalancing `A={x}, B={y}` to `A={y}, B={x}` in place loses one group whichever coordinate is written first.)
+3. Persist a transitional active slot set that is the **union** of the old and the new coordinates, before publishing anything.
+4. Publish every new slot in full, with atomic context groups intact (see Atomic Slot-Grouping Transport Rule), and confirm relay acceptance of all of them. If any publish fails, keep the transitional set and retry.
+5. Only then atomically persist the new active slot set (the replacement coordinates only), and only then retire the old coordinates (see Orphaned Blob Deletion).
+
+A crash at any point leaves the union set persisted, so the next cycle re-reads every coordinate and no group is lost. Old and new coordinates coexisting is safe: merge is componentwise `max()`, so a reader that unions both sees exactly the merged state.
 
 #### Orphaned Blob Deletion
 
-Clients MAY delete blobs from decommissioned client instances by publishing a `kind:5` deletion event per [NIP-09](09.md) targeting the orphaned event's `a` tag coordinate (`30078:<pubkey>:<d-tag-value>`). This is optional — orphaned blobs are harmless and age out naturally.
+Clients MAY delete blobs from decommissioned client instances by publishing a `kind:5` deletion event per [NIP-09](09.md) targeting the orphaned event's `a` tag coordinate (`30078:<pubkey>:<d-tag-value>`). For blobs carrying no `ov_*` entries this is optional — such orphans are harmless and age out naturally.
 
-Multi-slot clients that retire one or more of their own slot coordinates during rebalancing MUST delete only coordinates that are no longer in their active slot set. Active split slots MUST NOT be deleted. During rebalancing, old and new coordinates may coexist on the relay simultaneously without corrupting state, because merge is componentwise `max()`.
+A blob carrying `ov_*` entries MUST NOT be deleted, and a coordinate carrying them MUST NOT be retired, until its override state has been merged and durably republished under a currently-active coordinate (steps 1–5 of Slot Rebalancing and Retirement). This applies to the client's own retired coordinates and to same-`client_id` orphans discovered from a prior rotation or a backup/restore. A persisted active slot set MAY be stale — for example restored from a backup taken before a rebalance — so an unknown same-`client_id` coordinate MUST be treated as a live carrier of override state, not as a deletable duplicate, until it has been merged and carried forward.
+
+Active split slots (coordinates in the client's current active slot set) MUST NOT be deleted.
 
 ### Manual-Unread Override Layer
 
@@ -443,9 +463,9 @@ A context `ctx` has an active manual-unread override if and only if ALL of the f
 
 1. `S > 0` — at least one mark-unread action has been recorded.
 2. `F <= B` — the effective frontier has not advanced past the baseline captured at mark-unread time. (A natural frontier advance strictly past `B` dominates a stale set, clearing the override without any explicit clear action.)
-3. `S > C` — set counter exceeds clear counter. (Under **clear-wins** tie policy, `S == C` is treated as inactive.)
+3. `S > C` — set counter exceeds clear counter. (`S == C` is treated as inactive: clear wins on ties — see Tie Policy.)
 
-Formally (using `CLEAR` wins on ties, which is RECOMMENDED — see Tie Policy):
+Formally (clear-wins is the only conforming tie policy — see Tie Policy):
 
 ```
 override_active(S, C, B, F) =
@@ -466,7 +486,7 @@ where `latest_message_ts` is the `created_at` of the newest message in the conte
 
 **Mark-unread:** increment S to `max(S, C) + 1`; set B to the current effective frontier value for the context. C is unchanged. If `max(S, C) == 4294967295` (uint32 maximum), the client MUST refuse the mark-unread action and leave the register unchanged; wrapping or resetting to zero is prohibited.
 
-**Mark-read (explicit):** advance the frontier to cover the context as normal; increment C to `max(S, C) + 1`. S and B are unchanged. If `max(S, C) == 4294967295`, the client MUST refuse the mark-read counter increment and leave the register unchanged; the frontier advance still applies.
+**Mark-read (explicit):** advance the frontier to cover the context as normal; increment C to `max(S, C) + 1`. S and B are unchanged. If `max(S, C) == 4294967295`, no representable counter increment exists; wrapping or resetting to zero is prohibited. The client MUST then complete the action only if the resulting state satisfies `override_active == false` — i.e. the frontier advance alone deactivates the override, or the override was already inactive. Otherwise the counters MUST be left unchanged and the client MUST report the mark-read as failed; the monotone frontier advance itself is still permitted, but a client MUST NOT report an explicit mark-read as successful while `override_active` remains true.
 
 **Natural read (frontier advance):** advance the frontier past B. No counter update is needed — the liveness predicate's `F <= B` condition automatically deactivates the override when the frontier dominates the baseline.
 
@@ -502,9 +522,11 @@ Implementations that split blobs into slots MUST group context entries per logic
 
 #### Tie Policy
 
-**RECOMMENDED: clear-wins.** When `S == C` and `S > 0`, the override is treated as inactive. This avoids persistent false-positive unread badges and allows compacting `S == C` registers to the tombstone floor. A false negative (missed badge) is recoverable by re-marking unread. A false positive (badge that will not clear) is more disruptive.
+**Clients MUST use clear-wins.** When `S == C` and `S > 0`, the override MUST be treated as inactive, and the register MUST be compacted to the tombstone floor on publication (see Tombstone Floor).
 
-Set-wins (`S == C` → active) is permitted but not recommended. It prevents compacting tied registers and risks persistent badges that cannot be cleared without an explicit mark-read action.
+Clear-wins is normative rather than a local implementation choice because the tie verdict is not encoded on the wire. Two conforming clients holding the same merged register `(S, C, B, F) = (1, 1, 10, 10)` would otherwise disagree permanently: a clear-wins client reports read and publishes the single-key tombstone floor, a set-wins client reports unread and publishes all three keys. Further deliveries converge the counters but can never converge either the verdict or the canonical wire form, which defeats cross-device synchronization. Supporting a selectable tie policy would require encoding the policy in the blob plus a separate interoperability design; neither is in scope here.
+
+Clear-wins also matches the product semantics this layer is designed for: a false negative (a missed badge) is recoverable by re-marking unread, while a false positive (a badge that will not clear) is more disruptive. See `docs/formal/nip-rs-unread/NOTE.md` for the policy comparison — both policies satisfy the merge-correctness invariants in isolation, so this is an interoperability requirement, not a merge-safety one.
 
 #### Override State Durability
 
@@ -513,6 +535,11 @@ Set-wins (`S == C` → active) is permitted but not recommended. It prevents com
 Because legacy clients can carry and republish old `ov_*` keys indefinitely (they pass through `sanitizeContexts` as unknown opaque entries), there is no finite time after which all stale override components are guaranteed absent. Therefore:
 
 **Clients MUST NOT drop `ov_*` override entries (including tombstone floors) based on age pruning or budget eviction.** This exemption applies permanently. Age-based pruning applies to frontier entries only. Eviction strategies that respect byte/key budgets MUST apply to frontier and `msg:`/`thread:` entries first and MUST NOT touch `ov_*` entries.
+
+**Durability is a property of retrievable logical state, not of keys within one blob.** An override register survives only if a client that loads its full state can still reach every component. Therefore, in addition to the per-entry rule above:
+
+- Full-state loads by clients implementing this layer MUST NOT be restricted by a finite event-level `since` window; the containing event must remain reachable, not merely retain its keys (see Fetching).
+- No coordinate carrying `ov_*` entries may be retired, rebalanced away, or deleted until the componentwise-max of every override register it holds — especially every tombstone ceiling — has been republished under a currently-active coordinate and accepted by a relay (see Slot Rebalancing and Retirement, Client-ID Rotation, Orphaned Blob Deletion).
 
 **There is no safe finite GC horizon for override state.** Any protocol that proposes to delete tombstone floors after a bounded period requires a separately proved guarantee that no stale override component can re-enter the merge — this amendment does not provide such a guarantee.
 
@@ -527,7 +554,7 @@ Because legacy clients can carry and republish old `ov_*` keys indefinitely (the
 
 The design was verified by bounded exhaustive model checking prior to this amendment. See `docs/formal/nip-rs-unread/` for the full model (`model.py`, `exhaustive.py`), 9-mutant harness (`mutation.py`), and design notes (`NOTE.md`).
 
-The harness verifies the three load-bearing safety requirements — tombstone floor, mandatory canonical publication, and atomic slot-grouping with unescape-before-group — are necessary: each mutant that drops one of these rules produces a detectable witness of permanent false-clear or resurrection. M3 validates that the clear-wins tie policy produces the intended product-semantics behavior; M5 and M6 witness value-range and convergence failures respectively. The clear-wins policy is RECOMMENDED (see Tie Policy) but not a safety requirement — both tie policies pass all merge-correctness invariants.
+The harness verifies the three load-bearing safety requirements — tombstone floor, mandatory canonical publication, and atomic slot-grouping with unescape-before-group — are necessary: each mutant that drops one of these rules produces a detectable witness of permanent false-clear or resurrection. M3 validates that the clear-wins tie policy produces the intended product-semantics behavior; M5 and M6 witness value-range and convergence failures respectively. Clear-wins is normative for interoperability (see Tie Policy), not because set-wins violates merge safety — the model confirms both tie policies satisfy the merge-correctness invariants when applied uniformly.
 
 **Scope of formal verification:** the bounded model covers the CRDT register algebra, merge/compaction rules, slot-splitting atomicity, and escape/unescape bijection. It does NOT cover malformed-group wire validation (the accepted-shape rules in Content Validation). That rule is normative here and sound by the partial-group argument (rejecting a partial group leaves a virgin register — a merge no-op — which is strictly safer than zero-filling missing components), but its correctness under parser-level implementation is outside the model's verified scope. Implementation-level tests MUST cover the accepted wire shapes and rejection behavior.
 
